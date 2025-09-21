@@ -67,6 +67,9 @@ def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int 
     at the exact mm positions and sizes specified.
 
     Quadrant placement coordinates are interpreted as TOP-LEFT-origin (x_mm, y_mm).
+
+    Zoom behaviour: Quad B and D will be rendered at 120% (1.2x). Overlap is intentionally ignored
+    — images may overflow into neighboring quadrants.
     """
     # Import ImageReader here to avoid top-level import issues in some environments
     from io import BytesIO
@@ -91,13 +94,16 @@ def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int 
         (105.0, 149.0), # D (bottom-right)
     ]
 
+    # Zoom factors: apply 1.2x to B and D (indices 1 and 3), others remain 1.0
+    zoom_factors = [1.0, 1.2, 1.0, 1.2]
+
     # Create PDF in memory
     out_io = tempfile.SpooledTemporaryFile()
     c = canvas.Canvas(out_io, pagesize=A4)
     page_w_pt, page_h_pt = A4
 
     # For each page image, convert to PNG bytes (rendering already at DPI), then draw at location
-    for img, (x_mm, y_mm) in zip(pages, positions_mm):
+    for idx, (img, (x_mm, y_mm)) in enumerate(zip(pages, positions_mm)):
         # Ensure image is RGB
         if img.mode not in ("RGB", "RGBA"):
             img = img.convert("RGB")
@@ -110,13 +116,17 @@ def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int 
         # Wrap bytes into an ImageReader which ReportLab accepts
         img_reader = ImageReader(img_buf)
 
-        # Compute target dimensions in points
-        target_w_pt = mm_to_pt(quad_w_mm)
-        target_h_pt = mm_to_pt(quad_h_mm)
+        # Compute target dimensions in points, applying zoom for B/D
+        zoom = zoom_factors[idx]
+        base_w_pt = mm_to_pt(quad_w_mm)
+        base_h_pt = mm_to_pt(quad_h_mm)
+        target_w_pt = base_w_pt * zoom
+        target_h_pt = base_h_pt * zoom
 
         # Compute x in points from left
         x_pt = mm_to_pt(x_mm)
         # Convert y from TOP-LEFT reference to bottom-left (reportlab):
+        # When zoomed, we still align the image top to the specified y_mm so image overflows downward/rightward.
         y_pt = page_h_pt - mm_to_pt(y_mm) - target_h_pt
 
         # draw the PNG, scale to target width/height (in points)
