@@ -21,6 +21,7 @@ from pathlib import Path
 from flask import Flask, request, send_file, jsonify
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.base.exceptions import TwilioRestException
 import requests
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
@@ -123,10 +124,24 @@ def combine_two_pdfs_into_quad_paths(path1, path2, out_path):
 
 # Helper to send WhatsApp message via Twilio (text + optional media_url)
 def send_whatsapp_message(to_whatsapp_number, body, media_url=None):
-    if media_url:
-        twilio_client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp_number, body=body, media_url=[media_url])
-    else:
-        twilio_client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp_number, body=body)
+    """
+    Return True on success, False on failure (Twilio error or other exception).
+    Caller may fallback to TwiML if False.
+    """
+    try:
+        if media_url:
+            twilio_client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp_number, body=body, media_url=[media_url])
+        else:
+            twilio_client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp_number, body=body)
+        logger.info("Sent message via Twilio REST API to %s", to_whatsapp_number)
+        return True
+    except TwilioRestException as tre:
+        # Twilio-specific exceptions (e.g., 429 quota). Log and return False so caller can fallback.
+        logger.warning("Twilio REST exception while sending message: %s (code=%s, status=%s)", tre.msg, getattr(tre, "code", None), getattr(tre, "status", None))
+        return False
+    except Exception as e:
+        logger.exception("Unexpected error while sending message via Twilio: %s", e)
+        return False
 
 # Webhook: receive messages from Twilio (WhatsApp)
 @app.route("/webhook", methods=["POST"])
@@ -202,9 +217,26 @@ def webhook():
             out_path = Path(tempfile.gettempdir()) / f"combined_{file_id}.pdf"
             combine_two_pdfs_into_quad_paths(path1, path2, str(out_path))
             file_url = f"{HOST_BASE_URL}/download/{file_id}"
-            send_whatsapp_message(from_number, "Here is your combined PDF:", media_url=file_url)
 
-            # cleanup session files
+            # Try to send via Twilio REST API first (normal path).
+            sent = send_whatsapp_message(from_number, "Here is your combined PDF:", media_url=file_url)
+            if not sent:
+                # Fallback: reply inline with TwiML (so Twilio will send this message as response to the webhook)
+                logger.info("Falling back to TwiML inline response with media URL for %s", from_number)
+                tw = MessagingResponse()
+                m = tw.message("Here is your combined PDF (direct link):")
+                m.media(file_url)
+                # cleanup session files
+                for f in sess["files"]:
+                    try:
+                        Path(f["path"]).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                sess.clear()
+                user_sessions.pop(from_number, None)
+                return str(tw)
+
+            # If sent successfully via REST API, clean up session and return empty TwiML (ack)
             for f in sess["files"]:
                 try:
                     Path(f["path"]).unlink(missing_ok=True)
