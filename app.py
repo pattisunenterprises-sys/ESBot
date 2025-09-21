@@ -29,13 +29,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Load Twilio config
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")  # e.g. 'whatsapp:+1415XXXXXXX'
-HOST_BASE_URL = os.environ.get("HOST_BASE_URL")  # e.g. https://<your-ngrok-id>.ngrok.io
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")  # optional if using API Key
+TWILIO_API_KEY = os.environ.get("TWILIO_API_KEY")
+TWILIO_API_SECRET = os.environ.get("TWILIO_API_SECRET")
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")
+HOST_BASE_URL = os.environ.get("HOST_BASE_URL")
 
-if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM, HOST_BASE_URL]):
-    raise RuntimeError("Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM, HOST_BASE_URL in env")
+# Create Twilio client (prefer API Key + Secret, fallback to Auth Token)
+if TWILIO_API_KEY and TWILIO_API_SECRET and TWILIO_ACCOUNT_SID:
+    twilio_client = Client(TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_ACCOUNT_SID)
+elif TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+else:
+    raise RuntimeError("Set TWILIO_ACCOUNT_SID and (TWILIO_API_KEY + TWILIO_API_SECRET) or TWILIO_AUTH_TOKEN in env")
+
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
