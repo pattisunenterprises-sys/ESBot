@@ -1,24 +1,23 @@
 # app.py
 """
-WhatsApp PDF Quadrant Combiner Bot using Twilio + Flask.
+WhatsApp PDF Quadrant Combiner Bot (Flask + Twilio)
+- Authenticated download of Twilio media URLs (uses TWILIO_API_KEY/API_SECRET or TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN)
+- Collects two PDFs (each >= 2 pages), asks for confirmation, combines first 2 pages of each into 1 quadrant page PDF,
+  exposes it at /download/<id> and instructs Twilio to send that URL as media back to the user.
 
-Flow:
-- User sends PDFs to your Twilio WhatsApp number.
-- Bot collects PDFs per user (expects 2 PDFs, each with 2 pages).
-- When two PDFs are collected, bot sends a confirmation request.
-- If user replies "YES", bot generates a single-page PDF with 4 quadrants and sends it back.
-- If "NO", cancels and clears user state.
-
-Requirements:
-- Twilio account + WhatsApp sandbox or WhatsApp Business with a number.
-- Publicly accessible webhook (ngrok for local testing).
-- Environment variables in a .env file:
-    TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM, HOST_BASE_URL
+Environment variables required (set these in Render -> Environment):
+  - TWILIO_ACCOUNT_SID
+  - TWILIO_AUTH_TOKEN            (optional if using API key pair)
+  - TWILIO_API_KEY               (optional, preferred)
+  - TWILIO_API_SECRET            (optional, preferred)
+  - TWILIO_WHATSAPP_FROM         e.g. whatsapp:+14155238886
+  - HOST_BASE_URL                e.g. https://your-app-name.onrender.com
 """
 
 import os
 import tempfile
 import uuid
+import logging
 from pathlib import Path
 from flask import Flask, request, send_file
 from twilio.rest import Client
@@ -27,42 +26,56 @@ import requests
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 
+# Load .env locally (Render will use environment directly)
 load_dotenv()
 
-# Load Twilio config
+# Basic logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load config
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")  # optional if using API Key
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_API_KEY = os.environ.get("TWILIO_API_KEY")
 TWILIO_API_SECRET = os.environ.get("TWILIO_API_SECRET")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")
 HOST_BASE_URL = os.environ.get("HOST_BASE_URL")
 
-# Create Twilio client (prefer API Key + Secret, fallback to Auth Token)
+# Validate critical envs
+if not (TWILIO_WHATSAPP_FROM and HOST_BASE_URL and TWILIO_ACCOUNT_SID):
+    raise RuntimeError("Set TWILIO_ACCOUNT_SID, TWILIO_WHATSAPP_FROM and HOST_BASE_URL in env")
+
+# Create Twilio client: prefer API key pair, else fallback to account auth token
 if TWILIO_API_KEY and TWILIO_API_SECRET and TWILIO_ACCOUNT_SID:
     twilio_client = Client(TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_ACCOUNT_SID)
+    logger.info("Using Twilio API Key authentication")
 elif TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    logger.info("Using Twilio Account SID + Auth Token authentication")
 else:
     raise RuntimeError("Set TWILIO_ACCOUNT_SID and (TWILIO_API_KEY + TWILIO_API_SECRET) or TWILIO_AUTH_TOKEN in env")
 
-
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
 app = Flask(__name__)
 
-# In-memory user session store
-# For production, replace with persistent DB (Redis, DynamoDB, etc.)
+# In-memory user sessions (for production use persistent store)
 user_sessions = {}
-# Structure:
-# user_sessions[from_number] = {
-#    "files": [ { "path": "/tmp/..", "orig_name": "a.pdf" }, ... ],
-#    "state": "collecting" | "awaiting_confirm"
-# }
 
-# ---- helper: combine function (4 pages -> 1 quadrant page) ----
+# Health route
+@app.route("/", methods=["GET"])
+def health():
+    return "PDF WhatsApp bot is running.", 200
+
+# Serve generated files
+@app.route("/download/<file_id>", methods=["GET"])
+def download_generated(file_id):
+    temp_dir = Path(tempfile.gettempdir())
+    fp = temp_dir / f"combined_{file_id}.pdf"
+    if not fp.exists():
+        return "Not found", 404
+    return send_file(str(fp), as_attachment=True, download_name=f"combined_{file_id}.pdf")
+
+# Combine function
 def combine_two_pdfs_into_quad_paths(path1, path2, out_path):
-    """Open path1 and path2, each expected to have >=2 pages, take first 2 pages from each,
-    place in quadrants on single page and save to out_path"""
     doc1 = fitz.open(path1)
     doc2 = fitz.open(path2)
     if doc1.page_count < 2 or doc2.page_count < 2:
@@ -95,67 +108,79 @@ def combine_two_pdfs_into_quad_paths(path1, path2, out_path):
     doc1.close()
     doc2.close()
 
-# ---- helper: send message back (text + optional media) ----
+# Helper to send WhatsApp message via Twilio (text + optional media_url)
 def send_whatsapp_message(to_whatsapp_number, body, media_url=None):
     if media_url:
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_FROM,
-            to=to_whatsapp_number,
-            body=body,
-            media_url=[media_url],
-        )
+        twilio_client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp_number, body=body, media_url=[media_url])
     else:
         twilio_client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp_number, body=body)
 
-# ---- route: serve generated files publicly (Twilio will fetch this URL to upload to user) ----
-@app.route("/download/<file_id>", methods=["GET"])
-def download_generated(file_id):
-    temp_dir = Path(tempfile.gettempdir())
-    fp = temp_dir / f"combined_{file_id}.pdf"
-    if not fp.exists():
-        return "Not found", 404
-    return send_file(str(fp), as_attachment=True, download_name=f"combined_{file_id}.pdf")
-
-# ---- Twilio webhook to receive incoming messages ----
+# Webhook: receive messages from Twilio (WhatsApp)
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Parse Twilio form data
+    # Basic logging of incoming form for debugging
+    logger.info("Incoming webhook form data: %s", dict(request.values))
+
     from_number = request.values.get("From")  # e.g. 'whatsapp:+9199...'
     body = (request.values.get("Body") or "").strip()
     body_lower = body.lower()
     num_media = int(request.values.get("NumMedia", "0"))
 
-    # Ensure session exists
-    sess = user_sessions.setdefault(from_number, {"files": [], "state": "collecting"})
+    if not from_number:
+        # guard
+        resp = MessagingResponse()
+        resp.message("Missing From number in request.")
+        return str(resp)
 
+    sess = user_sessions.setdefault(from_number, {"files": [], "state": "collecting"})
     resp = MessagingResponse()
 
+    # 1) Handle incoming media attachments
     if num_media > 0:
-        # Twilio provides media URLs as MediaUrl0, MediaContentType0, etc.
         for i in range(num_media):
             m_url = request.values.get(f"MediaUrl{i}")
             m_type = request.values.get(f"MediaContentType{i}", "")
+            logger.info("Incoming media: index=%s url=%s content_type=%s", i, m_url, m_type)
+
             if "pdf" in m_type.lower():
-                # download media to temp file
-                r = requests.get(m_url)
-                if r.status_code != 200:
-                    resp.message("Failed to download attached file. Please try again.")
+                # Attempt authenticated download (preferred). Use API key pair if available, otherwise account SID+auth token
+                auth_user = TWILIO_API_KEY or TWILIO_ACCOUNT_SID
+                auth_pass = TWILIO_API_SECRET or TWILIO_AUTH_TOKEN
+
+                try:
+                    # Use auth by default (Twilio media URLs require it)
+                    if auth_user and auth_pass:
+                        r = requests.get(m_url, auth=(auth_user, auth_pass), timeout=30, allow_redirects=True)
+                    else:
+                        # fallback to public GET (rare)
+                        r = requests.get(m_url, timeout=30, allow_redirects=True)
+
+                    logger.info("Media GET: status=%s len=%s", getattr(r, "status_code", None), len(getattr(r, "content", b"")))
+                    if r.status_code == 200 and r.content and len(r.content) > 10:
+                        tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+                        tmpf.write(r.content)
+                        tmpf.flush()
+                        tmpf.close()
+                        sess["files"].append({"path": tmpf.name, "orig_name": f"file_{len(sess['files'])+1}.pdf"})
+                        resp.message(f"Received PDF #{len(sess['files'])}.")
+                    else:
+                        logger.error("Failed to download media: status=%s headers=%s", getattr(r, "status_code", None), getattr(r, "headers", {}))
+                        resp.message("Failed to download attached file. Please try again.")
+                        return str(resp)
+                except requests.exceptions.RequestException as ex:
+                    logger.exception("Exception while downloading media: %s", ex)
+                    resp.message("Failed to download attached file due to network error. Please try again.")
                     return str(resp)
-                tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-                tmpf.write(r.content)
-                tmpf.flush()
-                tmpf.close()
-                sess["files"].append({"path": tmpf.name, "orig_name": f"file_{len(sess['files'])+1}.pdf"})
-                resp.message(f"Received PDF #{len(sess['files'])}.")
             else:
                 resp.message("Received a non-PDF attachment — please send PDF files only.")
-        # If two PDFs collected, ask for confirmation
+
+        # After handling attachments, if we have two PDFs ask for confirm
         if len(sess["files"]) >= 2:
             sess["state"] = "awaiting_confirm"
             resp.message("Received two PDFs. Reply YES to confirm combine into a single page PDF, or NO to cancel.")
         return str(resp)
 
-    # No media — treat as text commands
+    # 2) Handle text commands (confirmation)
     if body_lower in ("yes", "y") and sess.get("state") == "awaiting_confirm" and len(sess["files"]) >= 2:
         try:
             path1 = sess["files"][0]["path"]
@@ -165,6 +190,8 @@ def webhook():
             combine_two_pdfs_into_quad_paths(path1, path2, str(out_path))
             file_url = f"{HOST_BASE_URL}/download/{file_id}"
             send_whatsapp_message(from_number, "Here is your combined PDF:", media_url=file_url)
+
+            # cleanup session files
             for f in sess["files"]:
                 try:
                     Path(f["path"]).unlink(missing_ok=True)
@@ -174,6 +201,7 @@ def webhook():
             user_sessions.pop(from_number, None)
             return str(MessagingResponse())
         except Exception as e:
+            logger.exception("Failed to combine/send PDFs: %s", e)
             resp.message(f"Failed to combine PDFs: {e}")
             return str(resp)
 
@@ -188,10 +216,12 @@ def webhook():
         resp.message("Cancelled. Your uploaded files were removed. Send PDFs again to start over.")
         return str(resp)
 
-    # default reply/help
+    # default help message
     resp.message("Hi — send me two PDFs (each with 2 pages). After I receive two, I'll ask you to confirm. Reply YES to proceed or NO to cancel.")
     return str(resp)
 
+
 if __name__ == "__main__":
-    # Run Flask dev server
-    app.run(port=5000, debug=True)
+    # Use port from environment (Render sets PORT), otherwise 5000 locally
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
