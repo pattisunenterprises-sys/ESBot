@@ -1,227 +1,199 @@
-# app.py
 """
-WhatsApp PDF Quadrant Combiner Bot (Flask + Twilio)
-- Authenticated download of Twilio media URLs (uses TWILIO_API_KEY/API_SECRET or TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN)
-- Collects two PDFs (each >= 2 pages), asks for confirmation, combines first 2 pages of each into 1 quadrant page PDF,
-  exposes it at /download/<id> and instructs Twilio to send that URL as media back to the user.
+app.py
 
-Environment variables required (set these in Render -> Environment):
-  - TWILIO_ACCOUNT_SID
-  - TWILIO_AUTH_TOKEN            (optional if using API key pair)
-  - TWILIO_API_KEY               (optional, preferred)
-  - TWILIO_API_SECRET            (optional, preferred)
-  - TWILIO_WHATSAPP_FROM         e.g. whatsapp:+14155238886
-  - HOST_BASE_URL                e.g. https://your-app-name.onrender.com
+Flask app that generates a high-quality PDF containing four quadrants
+each sized 99.1mm x 139mm at positions (mm, bottom-left origin):
+  - Quad A: (3, 10)
+  - Quad B: (105, 10)
+  - Quad C: (3, 149)
+  - Quad D: (105, 149)
+
+Pre-deployment geometry checks (asserts) run at import time to ensure
+the quads fit on A4 and do not overlap. No geometric fouling checks
+are performed at runtime when generating PDFs (per your request).
+
+Requires:
+  pip install flask reportlab
 """
 
+import io
 import os
-import tempfile
-import uuid
-import logging
-from pathlib import Path
-from flask import Flask, request, send_file
-from twilio.rest import Client
-from twilio.twiml.messaging_response import MessagingResponse
-import requests
-import fitz  # PyMuPDF
-from dotenv import load_dotenv
-
-# Load .env locally (Render will use environment directly)
-load_dotenv()
-
-# Basic logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Load config
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_API_KEY = os.environ.get("TWILIO_API_KEY")
-TWILIO_API_SECRET = os.environ.get("TWILIO_API_SECRET")
-TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")
-HOST_BASE_URL = os.environ.get("HOST_BASE_URL")
-
-# Validate critical envs
-if not (TWILIO_WHATSAPP_FROM and HOST_BASE_URL and TWILIO_ACCOUNT_SID):
-    raise RuntimeError("Set TWILIO_ACCOUNT_SID, TWILIO_WHATSAPP_FROM and HOST_BASE_URL in env")
-
-# Create Twilio client: prefer API key pair, else fallback to account auth token
-if TWILIO_API_KEY and TWILIO_API_SECRET and TWILIO_ACCOUNT_SID:
-    twilio_client = Client(TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_ACCOUNT_SID)
-    logger.info("Using Twilio API Key authentication")
-elif TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    logger.info("Using Twilio Account SID + Auth Token authentication")
-else:
-    raise RuntimeError("Set TWILIO_ACCOUNT_SID and (TWILIO_API_KEY + TWILIO_API_SECRET) or TWILIO_AUTH_TOKEN in env")
+from flask import Flask, send_file, request, jsonify
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
 
 app = Flask(__name__)
 
-# In-memory user sessions (for production use persistent store)
-user_sessions = {}
+# ---------------------------
+# Configuration (mm units)
+# ---------------------------
+PAGE_W_MM = 210.0
+PAGE_H_MM = 297.0
 
-# Health route
-@app.route("/", methods=["GET"])
-def health():
-    return "PDF WhatsApp bot is running.", 200
+QUAD_W_MM = 99.1
+QUAD_H_MM = 139.0
 
-# Serve generated files
-@app.route("/download/<file_id>", methods=["GET"])
-def download_generated(file_id):
-    temp_dir = Path(tempfile.gettempdir())
-    fp = temp_dir / f"combined_{file_id}.pdf"
-    if not fp.exists():
-        return "Not found", 404
-    return send_file(str(fp), as_attachment=True, download_name=f"combined_{file_id}.pdf")
+POSITIONS_MM = {
+    'A': (3.0, 10.0),
+    'B': (105.0, 10.0),
+    'C': (3.0, 149.0),
+    'D': (105.0, 149.0)
+}
 
-# Combine function
-def combine_two_pdfs_into_quad_paths(path1, path2, out_path):
-    doc1 = fitz.open(path1)
-    doc2 = fitz.open(path2)
-    if doc1.page_count < 2 or doc2.page_count < 2:
-        raise ValueError("Each PDF must have at least 2 pages")
-    pages = [doc1.load_page(i) for i in range(2)] + [doc2.load_page(i) for i in range(2)]
+# ---------------------------
+# Pre-deployment geometry checks (run once on import)
+# ---------------------------
+def _rect(name, x_mm, y_mm, w_mm, h_mm):
+    return (name, x_mm, y_mm, w_mm, h_mm)
 
-    ref_rect = pages[0].rect
-    pw, ph = ref_rect.width, ref_rect.height
-    final_w, final_h = pw * 2, ph * 2
+def _rects_from_config():
+    rects = []
+    for name, (x_mm, y_mm) in POSITIONS_MM.items():
+        rects.append(_rect(name, x_mm, y_mm, QUAD_W_MM, QUAD_H_MM))
+    return rects
 
-    out_doc = fitz.open()
-    out_page = out_doc.new_page(width=final_w, height=final_h)
+def _intersect(r1, r2):
+    # r: (name, x, y, w, h) in mm; origin bottom-left
+    _, x1, y1, w1, h1 = r1
+    _, x2, y2, w2, h2 = r2
+    if (x1 + w1) <= x2 or (x2 + w2) <= x1:
+        return False
+    if (y1 + h1) <= y2 or (y2 + h2) <= y1:
+        return False
+    return True
 
-    quad_positions = [
-        fitz.Rect(0, 0, final_w / 2, final_h / 2),
-        fitz.Rect(final_w / 2, 0, final_w, final_h / 2),
-        fitz.Rect(0, final_h / 2, final_w / 2, final_h),
-        fitz.Rect(final_w / 2, final_h / 2, final_w, final_h),
-    ]
+def _run_prechecks():
+    rects = _rects_from_config()
+    # check bounds
+    for name, x, y, w, h in rects:
+        assert x >= 0 and y >= 0, f"{name} has negative origin: {(x,y)}"
+        assert (x + w) <= PAGE_W_MM + 1e-6, f"{name} exceeds page width: x+w = {x+w} mm > {PAGE_W_MM} mm"
+        assert (y + h) <= PAGE_H_MM + 1e-6, f"{name} exceeds page height: y+h = {y+h} mm > {PAGE_H_MM} mm"
+    # check overlaps (touching edges allowed)
+    n = len(rects)
+    for i in range(n):
+        for j in range(i+1, n):
+            if _intersect(rects[i], rects[j]):
+                name_i = rects[i][0]; name_j = rects[j][0]
+                raise AssertionError(f"Rectangles {name_i} and {name_j} overlap (pre-deployment config error)")
 
-    for i, src_page in enumerate(pages):
-        mat = fitz.Matrix(1, 1)
-        pix = src_page.get_pixmap(matrix=mat, alpha=False)
-        img_bytes = pix.tobytes()
-        target_rect = quad_positions[i]
-        out_page.insert_image(target_rect, stream=img_bytes)
+# Execute pre-deployment checks now (will raise on import if invalid)
+_run_prechecks()
 
-    out_doc.save(out_path)
-    out_doc.close()
-    doc1.close()
-    doc2.close()
+# ---------------------------
+# Utility helpers
+# ---------------------------
+def mm_to_pt(value_mm: float) -> float:
+    """Convert mm to PDF points using reportlab's mm unit"""
+    return value_mm * mm
 
-# Helper to send WhatsApp message via Twilio (text + optional media_url)
-def send_whatsapp_message(to_whatsapp_number, body, media_url=None):
-    if media_url:
-        twilio_client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp_number, body=body, media_url=[media_url])
-    else:
-        twilio_client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp_number, body=body)
+def _draw_quadrants_on_canvas(c: canvas.Canvas, images=None, stroke_width_pt=0.5):
+    """
+    Draws the four quadrant frames and embeds images (if provided).
+    images: optional dict mapping 'A'|'B'|'C'|'D' to a filesystem path.
+    NOTE: No geometric fouling checks at runtime (prechecks already done).
+    """
+    # page size in pts
+    page_w_pt, page_h_pt = A4
 
-# Webhook: receive messages from Twilio (WhatsApp)
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    # Basic logging of incoming form for debugging
-    logger.info("Incoming webhook form data: %s", dict(request.values))
+    # quad size in pts
+    qw_pt = mm_to_pt(QUAD_W_MM)
+    qh_pt = mm_to_pt(QUAD_H_MM)
 
-    from_number = request.values.get("From")  # e.g. 'whatsapp:+9199...'
-    body = (request.values.get("Body") or "").strip()
-    body_lower = body.lower()
-    num_media = int(request.values.get("NumMedia", "0"))
+    # draw each rect and optional image
+    c.setLineWidth(stroke_width_pt)
+    c.setFont("Helvetica-Bold", 10)
 
-    if not from_number:
-        # guard
-        resp = MessagingResponse()
-        resp.message("Missing From number in request.")
-        return str(resp)
-
-    sess = user_sessions.setdefault(from_number, {"files": [], "state": "collecting"})
-    resp = MessagingResponse()
-
-    # 1) Handle incoming media attachments
-    if num_media > 0:
-        for i in range(num_media):
-            m_url = request.values.get(f"MediaUrl{i}")
-            m_type = request.values.get(f"MediaContentType{i}", "")
-            logger.info("Incoming media: index=%s url=%s content_type=%s", i, m_url, m_type)
-
-            if "pdf" in m_type.lower():
-                # Attempt authenticated download (preferred). Use API key pair if available, otherwise account SID+auth token
-                auth_user = TWILIO_API_KEY or TWILIO_ACCOUNT_SID
-                auth_pass = TWILIO_API_SECRET or TWILIO_AUTH_TOKEN
-
-                try:
-                    # Use auth by default (Twilio media URLs require it)
-                    if auth_user and auth_pass:
-                        r = requests.get(m_url, auth=(auth_user, auth_pass), timeout=30, allow_redirects=True)
-                    else:
-                        # fallback to public GET (rare)
-                        r = requests.get(m_url, timeout=30, allow_redirects=True)
-
-                    logger.info("Media GET: status=%s len=%s", getattr(r, "status_code", None), len(getattr(r, "content", b"")))
-                    if r.status_code == 200 and r.content and len(r.content) > 10:
-                        tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-                        tmpf.write(r.content)
-                        tmpf.flush()
-                        tmpf.close()
-                        sess["files"].append({"path": tmpf.name, "orig_name": f"file_{len(sess['files'])+1}.pdf"})
-                        resp.message(f"Received PDF #{len(sess['files'])}.")
-                    else:
-                        logger.error("Failed to download media: status=%s headers=%s", getattr(r, "status_code", None), getattr(r, "headers", {}))
-                        resp.message("Failed to download attached file. Please try again.")
-                        return str(resp)
-                except requests.exceptions.RequestException as ex:
-                    logger.exception("Exception while downloading media: %s", ex)
-                    resp.message("Failed to download attached file due to network error. Please try again.")
-                    return str(resp)
-            else:
-                resp.message("Received a non-PDF attachment — please send PDF files only.")
-
-        # After handling attachments, if we have two PDFs ask for confirm
-        if len(sess["files"]) >= 2:
-            sess["state"] = "awaiting_confirm"
-            resp.message("Received two PDFs. Reply YES to confirm combine into a single page PDF, or NO to cancel.")
-        return str(resp)
-
-    # 2) Handle text commands (confirmation)
-    if body_lower in ("yes", "y") and sess.get("state") == "awaiting_confirm" and len(sess["files"]) >= 2:
-        try:
-            path1 = sess["files"][0]["path"]
-            path2 = sess["files"][1]["path"]
-            file_id = uuid.uuid4().hex
-            out_path = Path(tempfile.gettempdir()) / f"combined_{file_id}.pdf"
-            combine_two_pdfs_into_quad_paths(path1, path2, str(out_path))
-            file_url = f"{HOST_BASE_URL}/download/{file_id}"
-            send_whatsapp_message(from_number, "Here is your combined PDF:", media_url=file_url)
-
-            # cleanup session files
-            for f in sess["files"]:
-                try:
-                    Path(f["path"]).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            sess.clear()
-            user_sessions.pop(from_number, None)
-            return str(MessagingResponse())
-        except Exception as e:
-            logger.exception("Failed to combine/send PDFs: %s", e)
-            resp.message(f"Failed to combine PDFs: {e}")
-            return str(resp)
-
-    if body_lower in ("no", "n") and sess.get("state") == "awaiting_confirm":
-        for f in sess["files"]:
+    for name, (px_mm, py_mm) in POSITIONS_MM.items():
+        x_pt = mm_to_pt(px_mm)
+        y_pt = mm_to_pt(py_mm)
+        # draw border
+        c.rect(x_pt, y_pt, qw_pt, qh_pt)
+        # label (top-left inside rect)
+        label_x = x_pt + mm_to_pt(2)
+        label_y = y_pt + qh_pt - mm_to_pt(6)
+        c.drawString(label_x, label_y, f"Quad {name} ({px_mm:.1f}mm, {py_mm:.1f}mm)")
+        # embed image if provided
+        if images and images.get(name):
+            img_path = images[name]
             try:
-                Path(f["path"]).unlink(missing_ok=True)
-            except Exception:
-                pass
-        sess.clear()
-        user_sessions.pop(from_number, None)
-        resp.message("Cancelled. Your uploaded files were removed. Send PDFs again to start over.")
-        return str(resp)
+                img = ImageReader(img_path)
+                iw, ih = img.getSize()
+                # compute maximum drawable area with a small margin
+                margin_pt = mm_to_pt(2)
+                max_w = qw_pt - 2 * margin_pt
+                max_h = qh_pt - 2 * margin_pt
+                scale = min(max_w / iw, max_h / ih)
+                draw_w = iw * scale
+                draw_h = ih * scale
+                draw_x = x_pt + (qw_pt - draw_w) / 2
+                draw_y = y_pt + (qh_pt - draw_h) / 2
+                # preserveAspectRatio is True by default when supplying width/height that match scale
+                c.drawImage(img, draw_x, draw_y, draw_w, draw_h, preserveAspectRatio=True, mask='auto')
+            except Exception as e:
+                # if image fails, annotate inside the quad with the error
+                c.setFont("Helvetica", 8)
+                err_x = x_pt + mm_to_pt(4)
+                err_y = y_pt + mm_to_pt(4)
+                c.drawString(err_x, err_y, f"Image load error: {e}")
+                c.setFont("Helvetica-Bold", 10)  # restore for next label
 
-    # default help message
-    resp.message("Hi — send me two PDFs (each with 2 pages). After I receive two, I'll ask you to confirm. Reply YES to proceed or NO to cancel.")
-    return str(resp)
+# ---------------------------
+# Endpoint
+# ---------------------------
+@app.route('/generate-quadrants', methods=['GET', 'POST'])
+def generate_quadrants():
+    """
+    Generates and returns a PDF containing the configured four quadrants.
+    Optional JSON POST body structure:
+    {
+      "images": {
+         "A": "/absolute/or/relative/path/to/highresA.jpg",
+         "B": "/path/to/highresB.png",
+         "C": "/path/to/highresC.tif",
+         "D": "/path/to/highresD.jpg"
+      }
+    }
+    Notes:
+      - image paths must be accessible to the running process (local filesystem).
+      - This route does not perform geometry checks at runtime.
+      - If an image fails to load, an annotation will appear inside the affected quad.
+    """
+    # Attempt to parse JSON body; allow GET as a convenience (no images)
+    data = request.get_json(silent=True) or {}
+    images = data.get('images') or {}
 
+    # Build PDF in memory
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    # Draw content
+    _draw_quadrants_on_canvas(c, images=images)
+    c.showPage()
+    c.save()
+    buffer.seek(0)
 
-if __name__ == "__main__":
-    # Use port from environment (Render sets PORT), otherwise 5000 locally
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # Return PDF as attachment
+    return send_file(buffer, mimetype='application/pdf', as_attachment=True, download_name='quadrants.pdf')
+
+# ---------------------------
+# Preserve existing behavior: expose root route if needed
+# ---------------------------
+@app.route('/')
+def index():
+    return jsonify({
+        "service": "quadrant-pdf-generator",
+        "endpoints": {
+            "generate_quadrants": "/generate-quadrants (GET or POST with optional JSON body)"
+        }
+    })
+
+# ---------------------------
+# App entrypoint
+# ---------------------------
+if __name__ == '__main__':
+    # Use env var PORT if set (useful for many PaaS), otherwise 5000
+    port = int(os.environ.get('PORT', 5000))
+    # In production, run via WSGI server (gunicorn/uwsgi). This is for local testing.
+    app.run(host='0.0.0.0', port=port, debug=False)
