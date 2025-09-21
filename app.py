@@ -1,13 +1,22 @@
 """
 WhatsApp PDF Quadrant Combiner Bot (Flask + Twilio)
 
-See the chat for a short summary of what changed. This file is the updated, drop-in Flask app that
-implements precise A4 quadrant placement, DPI-configurable rendering to PNG streams, Twilio REST send
-with TwiML fallback, authenticated media download, in-memory sessions, and /download/<id> serving.
+Single-file app:
+- /webhook (POST) Twilio WhatsApp webhook
+- /download/<file_id> serves generated PDF from tempdir
+- /health for readiness
+- In-memory sessions
+- Authenticated media download (prefers TWILIO_API_KEY + secret)
+- Twilio REST send with TwiML fallback
+- combine_pdfs_to_quadrant_pdf uses helper functions so you can place each quadrant independently
 
-Set environment variables on Render as described in the file header and in the conversation.
+Environment variables:
+- TWILIO_ACCOUNT_SID
+- TWILIO_AUTH_TOKEN (or TWILIO_API_KEY + TWILIO_API_SECRET)
+- TWILIO_WHATSAPP_FROM (e.g. "whatsapp:+1415...")
+- HOST_BASE_URL (public URL for /download links)
+- DPI (optional, default 300)
 """
-
 import os
 import tempfile
 import uuid
@@ -22,6 +31,7 @@ from pdf2image import convert_from_bytes
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
 from PIL import Image
 from dotenv import load_dotenv
 
@@ -57,34 +67,35 @@ app = Flask(__name__)
 # In-memory sessions
 user_sessions = {}
 
-# Helper mm -> points (reportlab uses points)
+# Geometry helpers
 def mm_to_pt(value_mm):
     return value_mm * mm
 
-# Combine function: takes two bytes objects (PDF content) and returns bytes of the combined A4 PDF
-def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int = DPI) -> bytes:
-    """Render first two pages of each PDF at `dpi`, place them as PNGs into a single A4 page
-    at the exact mm positions and sizes specified.
+# --- Image rendering & placement helpers ---
 
-    Quadrant placement coordinates are interpreted as TOP-LEFT-origin (x_mm, y_mm).
-
-    Zoom behaviour: Quad B and D will be rendered at 120% (1.2x). Overlap is intentionally ignored
-    — images may overflow into neighboring quadrants.
+def render_page_images(pdf_bytes: bytes, dpi: int = DPI):
     """
-    # Import ImageReader here to avoid top-level import issues in some environments
-    from io import BytesIO
-    from reportlab.lib.utils import ImageReader
-
-    # Render first two pages of each PDF
-    imgs1 = convert_from_bytes(pdf_bytes1, dpi=dpi, first_page=1, last_page=2)
-    imgs2 = convert_from_bytes(pdf_bytes2, dpi=dpi, first_page=1, last_page=2)
-
-    if len(imgs1) < 2 or len(imgs2) < 2:
+    Render first two pages of a PDF to PIL Images (PNG-ready).
+    Returns a list of PIL.Image objects (length >=2 or raises).
+    """
+    imgs = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=2)
+    if len(imgs) < 2:
         raise ValueError("Each PDF must have at least 2 pages")
+    return imgs
 
-    pages = [imgs1[0], imgs1[1], imgs2[0], imgs2[1]]  # A, B, C, D order
+def place_image_on_canvas(cnv: canvas.Canvas, pil_img: Image.Image,
+                          quadrant_index: int,
+                          zoom: float = 1.0,
+                          anchor_top_left: bool = True):
+    """
+    Draw a PIL image onto `cnv` at the specified quadrant index:
+      quadrant_index: 0=A, 1=B, 2=C, 3=D
 
-    # Target sizes and positions in mm (from spec)
+    zoom: multiplier applied to the base quadrant size (1.0 default).
+    anchor_top_left: if True, align image top-left to quadrant coords.
+                     if False, center image on the quadrant center.
+    """
+    # Base quadrant geometry (spec) in mm
     quad_w_mm = 99.1
     quad_h_mm = 139.0
     positions_mm = [
@@ -93,57 +104,76 @@ def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int 
         (3.0, 149.0),   # C (bottom-left)
         (105.0, 149.0), # D (bottom-right)
     ]
+    if quadrant_index < 0 or quadrant_index > 3:
+        raise ValueError("quadrant_index must be 0..3")
 
-    # Zoom factors: apply 1.2x to B and D (indices 1 and 3), others remain 1.0
-    zoom_factors = [1.0, 1.2, 1.0, 1.2]
+    x_mm, y_mm = positions_mm[quadrant_index]
+    base_w_pt = mm_to_pt(quad_w_mm)
+    base_h_pt = mm_to_pt(quad_h_mm)
+    target_w_pt = base_w_pt * zoom
+    target_h_pt = base_h_pt * zoom
 
-    # Create PDF in memory
-    out_io = tempfile.SpooledTemporaryFile()
-    c = canvas.Canvas(out_io, pagesize=A4)
     page_w_pt, page_h_pt = A4
 
-    # For each page image, convert to PNG bytes (rendering already at DPI), then draw at location
-    for idx, (img, (x_mm, y_mm)) in enumerate(zip(pages, positions_mm)):
-        # Ensure image is RGB
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB")
-
-        # Save PNG to bytes
-        img_buf = BytesIO()
-        img.save(img_buf, format="PNG")
-        img_buf.seek(0)
-
-        # Wrap bytes into an ImageReader which ReportLab accepts
-        img_reader = ImageReader(img_buf)
-
-        # Compute target dimensions in points, applying zoom for B/D
-        zoom = zoom_factors[idx]
-        base_w_pt = mm_to_pt(quad_w_mm)
-        base_h_pt = mm_to_pt(quad_h_mm)
-        target_w_pt = base_w_pt * zoom
-        target_h_pt = base_h_pt * zoom
-
-        # Compute x in points from left
+    # Determine placement (reportlab's origin is bottom-left)
+    if not anchor_top_left:
+        # center image on quadrant center
+        center_x_mm = x_mm + (quad_w_mm / 2.0)
+        center_y_mm = y_mm + (quad_h_mm / 2.0)
+        center_x_pt = mm_to_pt(center_x_mm)
+        # ReportLab uses bottom-left origin. Compute y such that image is centered vertically.
+        x_pt = center_x_pt - (target_w_pt / 2.0)
+        y_pt = page_h_pt - mm_to_pt(center_y_mm) - (target_h_pt / 2.0)
+    else:
+        # anchor top-left of image to x_mm,y_mm
         x_pt = mm_to_pt(x_mm)
-        # Convert y from TOP-LEFT reference to bottom-left (reportlab):
-        # When zoomed, we still align the image top to the specified y_mm so image overflows downward/rightward.
         y_pt = page_h_pt - mm_to_pt(y_mm) - target_h_pt
 
-        # draw the PNG, scale to target width/height (in points)
-        c.drawImage(img_reader, x_pt, y_pt, width=target_w_pt, height=target_h_pt, preserveAspectRatio=True, anchor='sw')
+    # Ensure RGB config
+    if pil_img.mode not in ("RGB", "RGBA"):
+        pil_img = pil_img.convert("RGB")
 
-        img_buf.close()
+    from io import BytesIO
+    buf = BytesIO()
+    pil_img.save(buf, format="PNG")
+    buf.seek(0)
+    img_reader = ImageReader(buf)
 
-    c.showPage()
-    c.save()
+    # draw; preserveAspectRatio will scale the image uniformly to fit box
+    cnv.drawImage(img_reader, x_pt, y_pt, width=target_w_pt, height=target_h_pt, preserveAspectRatio=True, anchor='sw')
 
+    buf.close()
+
+def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int = DPI) -> bytes:
+    """
+    High-level combine: renders first 2 pages from each PDF and places them into
+    quadrants A,B,C,D. Uses place_image_on_canvas for per-quadrant control.
+    """
+    imgs1 = render_page_images(pdf_bytes1, dpi=dpi)
+    imgs2 = render_page_images(pdf_bytes2, dpi=dpi)
+    pages = [imgs1[0], imgs1[1], imgs2[0], imgs2[1]]  # A,B,C,D
+
+    # Per-quadrant zoom factors (easy to change)
+    zoom_factors = [1.0, 1.2, 1.0, 1.2]  # B and D zoomed 20% by default
+
+    out_io = tempfile.SpooledTemporaryFile()
+    cnv = canvas.Canvas(out_io, pagesize=A4)
+
+    # Place each quadrant. You can change anchor_top_left per-call to center zoomed images.
+    for idx, pil_img in enumerate(pages):
+        # For zoomed quadrants you may want to keep top-left anchor (overflow)
+        # or set anchor_top_left=False to center the zoom around quadrant center.
+        anchor_top_left = True
+        place_image_on_canvas(cnv, pil_img, quadrant_index=idx, zoom=zoom_factors[idx], anchor_top_left=anchor_top_left)
+
+    cnv.showPage()
+    cnv.save()
     out_io.seek(0)
-    pdf_bytes = out_io.read()
+    result = out_io.read()
     out_io.close()
-    return pdf_bytes
+    return result
 
-
-# Helper to send WhatsApp message via Twilio REST API
+# --- Twilio helper to send WhatsApp messages ---
 def send_whatsapp_message(to_whatsapp_number, body, media_url=None):
     try:
         if media_url:
@@ -159,8 +189,7 @@ def send_whatsapp_message(to_whatsapp_number, body, media_url=None):
         logger.exception("Unexpected Twilio send error: %s", e)
         return False
 
-
-# Routes
+# --- Routes ---
 @app.route('/', methods=['GET'])
 def root():
     return jsonify({
@@ -173,11 +202,9 @@ def root():
         }
     }), 200
 
-
 @app.route('/health', methods=['GET'])
 def health():
     return 'OK', 200
-
 
 @app.route('/download/<file_id>', methods=['GET'])
 def download_generated(file_id):
@@ -186,7 +213,6 @@ def download_generated(file_id):
     if not fp.exists():
         return "Not found", 404
     return send_file(str(fp), as_attachment=True, download_name=f"combined_{file_id}.pdf")
-
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -222,7 +248,6 @@ def webhook():
                         r = requests.get(m_url, timeout=30)
 
                     if r.status_code == 200 and r.content and len(r.content) > 10:
-                        # store bytes in temp file
                         tmpf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
                         tmpf.write(r.content)
                         tmpf.flush()
@@ -304,9 +329,8 @@ def webhook():
         return str(resp)
 
     # default
-    resp.message('Hi — send me two PDFs (each with 2 pages). After I receive two, I\'ll ask you to confirm. Reply YES to proceed or NO to cancel.')
+    resp.message('Hi — send me two PDFs (each with 2 pages). After I receive two, I\\'ll ask you to confirm. Reply YES to proceed or NO to cancel.')
     return str(resp)
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
