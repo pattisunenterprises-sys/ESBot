@@ -68,6 +68,10 @@ def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int 
 
     Quadrant placement coordinates are interpreted as TOP-LEFT-origin (x_mm, y_mm).
     """
+    # Import ImageReader here to avoid top-level import issues in some environments
+    from io import BytesIO
+    from reportlab.lib.utils import ImageReader
+
     # Render first two pages of each PDF
     imgs1 = convert_from_bytes(pdf_bytes1, dpi=dpi, first_page=1, last_page=2)
     imgs2 = convert_from_bytes(pdf_bytes2, dpi=dpi, first_page=1, last_page=2)
@@ -99,10 +103,12 @@ def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int 
             img = img.convert("RGB")
 
         # Save PNG to bytes
-        from io import BytesIO
         img_buf = BytesIO()
         img.save(img_buf, format="PNG")
         img_buf.seek(0)
+
+        # Wrap bytes into an ImageReader which ReportLab accepts
+        img_reader = ImageReader(img_buf)
 
         # Compute target dimensions in points
         target_w_pt = mm_to_pt(quad_w_mm)
@@ -114,7 +120,7 @@ def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int 
         y_pt = page_h_pt - mm_to_pt(y_mm) - target_h_pt
 
         # draw the PNG, scale to target width/height (in points)
-        c.drawImage(img_buf, x_pt, y_pt, width=target_w_pt, height=target_h_pt, preserveAspectRatio=True, anchor='sw')
+        c.drawImage(img_reader, x_pt, y_pt, width=target_w_pt, height=target_h_pt, preserveAspectRatio=True, anchor='sw')
 
         img_buf.close()
 
