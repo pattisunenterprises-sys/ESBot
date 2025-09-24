@@ -87,9 +87,9 @@ def place_image_on_canvas(cnv: canvas.Canvas, pil_img: Image.Image,
     quad_h_mm = 139.0
     positions_mm = [
         (7.0, 12.0),    # A (top-left)
-        (102.0, 12.0),  # B (top-right)
-        (3.0, 149.0),   # C (bottom-left)
-        (105.0, 149.0), # D (bottom-right)
+        (100.0, 14.0),  # B (top-right)
+        (7.0, 150.0),   # C (bottom-left)
+        (100.0, 152.0), # D (bottom-right)
     ]
     if quadrant_index < 0 or quadrant_index > 3:
         raise ValueError("quadrant_index must be 0..3")
@@ -131,7 +131,7 @@ def combine_pdfs_to_quadrant_pdf(pdf_bytes1: bytes, pdf_bytes2: bytes, dpi: int 
     imgs2 = render_page_images(pdf_bytes2, dpi=dpi)
     pages = [imgs1[0], imgs1[1], imgs2[0], imgs2[1]]  # A,B,C,D
 
-    zoom_factors = [1.0, 1.15, 1.0, 1.15]  # B and D zoomed
+    zoom_factors = [1.0, 1.125, 1.0, 1.125]  # B and D zoomed
 
     out_io = tempfile.SpooledTemporaryFile()
     cnv = canvas.Canvas(out_io, pagesize=A4)
